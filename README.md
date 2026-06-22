@@ -194,3 +194,209 @@ if __name__ == "__main__":
 
 
 
+# 2. *Two*
+To give you a genuinely different approach, we will build **Agent #2** using the **ReAct (Reasoning and Acting) Architecture**. 
+
+While the first agent relied on the AI model's native "Tool Calling" JSON API, the ReAct agent uses **Text Parsing**. The AI writes out its internal "Thoughts", decides on an "Action", and then receives an "Observation". 
+
+**Why build this one?**
+1. **Model Agnostic:** It works with *any* local text model, even smaller or older ones that don't support native JSON tool-calling.
+2. **Transparent:** You can literally read the AI's "Thought" process to see exactly *why* it is doing something.
+3. **Keyboard Shortcuts:** It includes native hotkey support (e.g., `Ctrl+C`), which is crucial for desktop automation.
+
+Here is the complete code for the **ReAct Desktop Agent**.
+
+### The ReAct Desktop Agent (Python Backend)
+
+Save this as `react_agent.py`.
+
+```python
+import ollama
+import pyautogui
+import subprocess
+import re
+import time
+import ast
+
+# ==========================================
+# 1. SAFETY GUARDRAILS
+# ==========================================
+DESTRUCTIVE_PATTERNS = [r'rm\s+-rf\s+/', r'format\s+[a-zA-Z]:', r'del\s+/f\s+/s\s+/q']
+
+def is_safe_command(command):
+    for pattern in DESTRUCTIVE_PATTERNS:
+        if re.search(pattern, command, re.IGNORECASE):
+            return False
+    return True
+
+# ==========================================
+# 2. THE "HANDS" (Available Tools)
+# ==========================================
+def tool_run_cmd(command: str) -> str:
+    if not is_safe_command(command):
+        return "Error: Command blocked by safety guardrails."
+    try:
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=10)
+        return result.stdout.strip() if result.stdout else result.stderr.strip()
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+def tool_click(x: int, y: int) -> str:
+    pyautogui.click(x, y)
+    return f"Success: Clicked at ({x}, {y})"
+
+def tool_type_text(text: str) -> str:
+    time.sleep(0.5)
+    pyautogui.write(text, interval=0.02)
+    return f"Success: Typed '{text}'"
+
+def tool_press_key(key_combo: str) -> str:
+    # Handles single keys ('enter') or combos ('ctrl', 'c')
+    keys = [k.strip().lower() for k in key_combo.split('+')]
+    pyautogui.hotkey(*keys)
+    return f"Success: Pressed {key_combo}"
+
+# Map string names to actual functions
+TOOLS = {
+    "run_cmd": tool_run_cmd,
+    "click": tool_click,
+    "type_text": tool_type_text,
+    "press_key": tool_press_key
+}
+
+# ==========================================
+# 3. THE REACT PROMPT
+# ==========================================
+SYSTEM_PROMPT = """You are an autonomous AI desktop agent. Your goal is to complete the user's task by interacting with the computer.
+You must use the following loop format strictly:
+
+Thought: [Your reasoning about what to do next]
+Action: [The tool to use]
+Action Input: [The input for the tool, formatted as a python dictionary or string]
+
+Available Tools:
+- run_cmd(command: str): Runs a terminal command.
+- click(x: int, y: int): Clicks the mouse at screen coordinates.
+- type_text(text: str): Types text on the keyboard.
+- press_key(key_combo: str): Presses a key or combo (e.g., 'enter', 'ctrl+c', 'alt+f4').
+
+When you have completed the task and have the final answer, use this exact format:
+Thought: I now know the final answer.
+Final Answer: [Your final response to the user]
+
+Begin!
+"""
+
+# ==========================================
+# 4. THE REACT EXECUTION LOOP
+# ==========================================
+def run_react_agent(task: str, model_name: str = "llama3.1"):
+    print(f"\n🚀 STARTING REACT AGENT | Task: {task}\n" + "="*50)
+    
+    # Initialize conversation history
+    messages = [
+        {'role': 'system', 'content': SYSTEM_PROMPT},
+        {'role': 'user', 'content': task}
+    ]
+    
+    max_iterations = 10 # Prevent infinite loops
+    iteration = 0
+
+    while iteration < max_iterations:
+        iteration += 1
+        print(f"\n--- Iteration {iteration} ---")
+        
+        # 1. ASK THE AI
+        response = ollama.chat(model=model_name, messages=messages)
+        ai_text = response['message']['content']
+        print(f"AI Output:\n{ai_text}\n")
+        
+        messages.append({'role': 'assistant', 'content': ai_text})
+
+        # 2. CHECK FOR COMPLETION
+        if "Final Answer:" in ai_text:
+            final_answer = ai_text.split("Final Answer:")[-1].strip()
+            print("\n" + "="*50)
+            print(f"✅ TASK COMPLETED: {final_answer}")
+            return final_answer
+
+        # 3. PARSE ACTION AND ACTION INPUT
+        action_match = re.search(r"Action:\s*(.*?)\n", ai_text)
+        input_match = re.search(r"Action Input:\s*(.*?)\n", ai_text, re.DOTALL)
+
+        if not action_match or not input_match:
+            print("⚠️ AI failed to format Action/Action Input. Halting.")
+            break
+
+        action_name = action_match.group(1).strip()
+        action_input_raw = input_match.group(1).strip()
+
+        # 4. EXECUTE THE TOOL
+        if action_name in TOOLS:
+            try:
+                # Safely evaluate the input (handles dicts, strings, ints)
+                # We wrap it in a safe eval context
+                parsed_input = ast.literal_eval(action_input_raw)
+                
+                if isinstance(parsed_input, dict):
+                    result = TOOLS[action_name](**parsed_input)
+                else:
+                    result = TOOLS[action_name](parsed_input)
+                    
+                print(f"🛠️ Executed [{action_name}] -> Result: {result}")
+                
+                # 5. FEED OBSERVATION BACK TO AI
+                observation = f"Observation: {result}"
+                messages.append({'role': 'user', 'content': observation})
+                
+            except Exception as e:
+                error_msg = f"Observation: Error executing tool. {str(e)}"
+                print(f"❌ {error_msg}")
+                messages.append({'role': 'user', 'content': error_msg})
+        else:
+            error_msg = f"Observation: Unknown tool '{action_name}'."
+            print(f"❌ {error_msg}")
+            messages.append({'role': 'user', 'content': error_msg})
+
+    print("\n⚠️ Reached maximum iterations without finishing.")
+
+# ==========================================
+# 5. RUN THE AGENT
+# ==========================================
+if __name__ == "__main__":
+    # Ensure pyautogui doesn't fail on edge cases
+    pyautogui.FAILSAFE = True 
+    
+    # Give the AI 2 seconds to focus the right window before it starts typing/clicking
+    print("Starting in 3 seconds. Make sure your desktop is ready...")
+    time.sleep(3)
+
+    # Example Task: Open notepad, type a message, and save it using keyboard shortcuts
+    user_task = """
+    Open notepad. 
+    Type the following text: 'ReAct agents are awesome.' 
+    Then, use keyboard shortcuts to save the file to the desktop as 'react_test.txt'. 
+    (Hint: Use Ctrl+S, then type the filename, then press Enter).
+    """
+    
+    run_react_agent(user_task)
+```
+
+### How to use this Agent:
+
+1. **Install Dependencies:**
+   ```bash
+   pip install ollama pyautogui
+   ```
+2. **Pull a Model:** 
+   ReAct parsing works best with models that follow instructions well. Llama 3 or Mistral are great.
+   ```bash
+   ollama pull llama3.1
+   ```
+3. **Run the Script:**
+   ```bash
+   python react_agent.py
+   ```
+
+### Why this architecture is powerful:
+If the AI makes a mistake (e.g., it tries to click the wrong coordinate), it will see the `Observation` fail. In the next `Thought` block, it will realize its mistake and say: *"Observation showed the click failed. I will try using the `run_cmd` tool to open the app via terminal instead."* This self-correction loop is the hallmark of advanced autonomous agents.
